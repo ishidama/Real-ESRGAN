@@ -944,7 +944,7 @@ def main():
         "-n",
         "--model_name",
         type=str,
-        default="realesr-animevideov3",
+        default="realesr-general-x4v3",
         help=(
             "モデル名: realesr-animevideov3 | RealESRGAN_x4plus_anime_6B | RealESRGAN_x4plus | RealESRNet_x4plus |"
             " RealESRGAN_x2plus | realesr-general-x4v3"
