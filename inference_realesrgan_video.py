@@ -555,67 +555,133 @@ def run(args):
         )
         args.input = tmp_frames_folder
 
-    # GPU数とプロセス数の計算
-    num_gpus = torch.cuda.device_count()
-    num_process = num_gpus * args.num_process_per_gpu
+
+    # デバイスの検出と設定
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        device_type = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        # Apple Silicon (M1/M2/M3) MPSの場合は1つのGPUとしてカウント
+        num_gpus = 1
+        device_type = "mps"
+        print("Using MPS device (Apple Silicon GPU)")
+    else:
+        num_gpus = 0
+        device_type = "cpu"
+        print("Using CPU for processing")
+
+    # プロセス数の計算
+    num_process = max(1, num_gpus * args.num_process_per_gpu)
+    print(f"処理に使用するプロセス数: {num_process}")
 
     # シングルプロセスの場合
     if num_process == 1:
-        inference_video(args, video_save_path)
-        return
+        # デバイスの選択
+        if device_type == "cuda":
+            device = torch.device("cuda:0")
+            print("NVIDIA GPU (CUDA) を使用して処理を実行します")
+        elif device_type == "mps":
+            device = torch.device("mps")
+            print("Apple Silicon GPU (M1/M2/M3) を使用して処理を実行します")
+            if args.fp32:
+                print(
+                    "注意: MPS (Apple Silicon) でfp32を使用します。精度は向上しますが処理速度が低下する場合があります"
+                )
+            else:
+                print(
+                    "注意: MPS (Apple Silicon) でfp16を使用します。処理が不安定な場合は --fp32 を追加してください"
+                )
+        else:
+            device = torch.device("cpu")
+            print("CPU を使用して処理を実行します（処理に時間がかかります）")
 
-    # マルチプロセス処理
-    ctx = torch.multiprocessing.get_context("spawn")
-    pool = ctx.Pool(num_process)
-    os.makedirs(
-        osp.join(args.output, f"{args.video_name}_out_tmp_videos"), exist_ok=True
-    )
-    pbar = tqdm(total=num_process, unit="sub_video", desc="inference")
-    for i in range(num_process):
-        sub_video_save_path = osp.join(
-            args.output, f"{args.video_name}_out_tmp_videos", f"{i:03d}.mp4"
+        inference_video(args, video_save_path, device=device)
+    else:
+        # マルチプロセス処理
+        ctx = torch.multiprocessing.get_context("spawn")
+        pool = ctx.Pool(num_process)
+        os.makedirs(
+            osp.join(args.output, f"{args.video_name}_out_tmp_videos"), exist_ok=True
         )
-        pool.apply_async(
-            inference_video,
-            args=(
-                args,
-                sub_video_save_path,
-                torch.device(i % num_gpus),
-                num_process,
-                i,
-            ),
-            callback=lambda arg: pbar.update(1),
-        )
-    pool.close()
-    pool.join()
-
-    # 分割されたビデオの結合
-    # vidlist.txtの準備
-    with open(f"{args.output}/{args.video_name}_vidlist.txt", "w") as f:
+        pbar = tqdm(total=num_process, unit="sub_video", desc="inference")
         for i in range(num_process):
-            f.write(f"file '{args.video_name}_out_tmp_videos/{i:03d}.mp4'\n")
+            sub_video_save_path = osp.join(
+                args.output, f"{args.video_name}_out_tmp_videos", f"{i:03d}.mp4"
+            )
+            pool.apply_async(
+                inference_video,
+                args=(
+                    args,
+                    sub_video_save_path,
+                    torch.device(i % num_gpus),
+                    num_process,
+                    i,
+                ),
+                callback=lambda arg: pbar.update(1),
+            )
+        pool.close()
+        pool.join()
 
-    # ffmpegでビデオ結合
-    cmd = [
-        args.ffmpeg_bin,
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        f"{args.output}/{args.video_name}_vidlist.txt",
-        "-c",
-        "copy",
-        f"{video_save_path}",
-    ]
-    print(" ".join(cmd))
-    subprocess.call(cmd)
+        # 分割されたビデオの結合
+        # vidlist.txtの準備
+        with open(f"{args.output}/{args.video_name}_vidlist.txt", "w") as f:
+            for i in range(num_process):
+                f.write(f"file '{args.video_name}_out_tmp_videos/{i:03d}.mp4'\n")
 
-    # 一時ファイルの削除
-    shutil.rmtree(osp.join(args.output, f"{args.video_name}_out_tmp_videos"))
-    if osp.exists(osp.join(args.output, f"{args.video_name}_inp_tmp_videos")):
-        shutil.rmtree(osp.join(args.output, f"{args.video_name}_inp_tmp_videos"))
-    os.remove(f"{args.output}/{args.video_name}_vidlist.txt")
+        # ffmpegでビデオ結合
+        cmd = [
+            args.ffmpeg_bin,
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            f"{args.output}/{args.video_name}_vidlist.txt",
+            "-c",
+            "copy",
+            f"{video_save_path}",
+        ]
+        print(" ".join(cmd))
+        subprocess.call(cmd)
+
+        # 一時ファイルの削除
+        shutil.rmtree(osp.join(args.output, f"{args.video_name}_out_tmp_videos"))
+        if osp.exists(osp.join(args.output, f"{args.video_name}_inp_tmp_videos")):
+            shutil.rmtree(osp.join(args.output, f"{args.video_name}_inp_tmp_videos"))
+        os.remove(f"{args.output}/{args.video_name}_vidlist.txt")
+
+
+    # ↓↓↓ ここでmkv再パッケージ処理を必ず呼ぶ
+    if args.input.lower().endswith(".mkv"):
+        final_mkv_path = osp.join(
+            args.output, f"{args.video_name}_{args.suffix}.mkv"
+        )
+        print("mkv入力なので、動画以外の全トラックを保持してmkvで出力します")
+        mkv_cmd = [
+            args.ffmpeg_bin,
+            "-i",
+            args.input,
+            "-i",
+            video_save_path,
+            "-map",
+            "1:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "0:s?",
+            "-map",
+            "0:t?",
+            "-c",
+            "copy",
+            "-y",
+            final_mkv_path,
+        ]
+        print("mkv再パッケージコマンド: " + " ".join(mkv_cmd))
+        subprocess.run(mkv_cmd, check=True)
+        print("最終出力: " + final_mkv_path)
+        # os.remove(video_save_path)
+    return
+
 
 
 def main():
