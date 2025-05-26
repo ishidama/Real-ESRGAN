@@ -73,7 +73,7 @@ python test_coreml.py \
 | PyTorch (GPU) | 4.47秒 | 1.0x | 基準 |
 | CoreML (ANE) | 0.19秒 | **23.99x** | 28.33 dB |
 
-*テスト環境: Apple Silicon M2, 200x200 → 800x800*
+*テスト環境: Apple Silicon M4Max, 200x200 → 800x800*
 
 ## 🔍 技術詳細
 
