@@ -1,18 +1,18 @@
 # Real-ESRGANビデオ推論スクリプト
 # ビデオ、画像、フォルダに対してReal-ESRGANによる超解像処理を実行します
 import argparse
+import cv2
 import glob
 import mimetypes
+import numpy as np
 import os
 import shutil
 import subprocess
-from os import path as osp
-
-import cv2
-import numpy as np
+import time
 import torch
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
+from os import path as osp
 from tqdm import tqdm
 
 from realesrgan import RealESRGANer
@@ -29,26 +29,70 @@ except ImportError:
 
 
 def get_video_meta_info(video_path):
-    """
-    ビデオファイルのメタデータ情報を取得する
+    """動画ファイルからメタ情報を取得する関数
 
     Args:
-        video_path: ビデオファイルのパス
+        video_path (str): 動画ファイルのパス
 
     Returns:
-        dict: ビデオの幅、高さ、FPS、音声情報、フレーム数を含む辞書
+        dict: 動画のメタ情報を含む辞書（width, height, fps, audio, nb_frames, is_interlaced, field_order,
+              display_aspect_ratio, sample_aspect_ratio, codec_name）
+
+    Raises:
+        RuntimeError: 動画解析に失敗した場合
     """
     try:
         ret = {}
         probe = ffmpeg.probe(video_path)
 
+        # ビデオストリーム情報の取得
         video_streams = [
             stream for stream in probe["streams"] if stream["codec_type"] == "video"
         ]
+
+        if not video_streams:
+            raise RuntimeError(f"No video stream found in {video_path}")
+
+        # オーディオの有無を確認
         has_audio = any(stream["codec_type"] == "audio" for stream in probe["streams"])
-        ret["width"] = video_streams[0]["width"]
-        ret["height"] = video_streams[0]["height"]
-        ret["fps"] = eval(video_streams[0]["avg_frame_rate"])
+
+        # 動画コーデック名を取得
+        if "codec_name" in video_streams[0]:
+            ret["codec_name"] = video_streams[0]["codec_name"]
+        else:
+            ret["codec_name"] = "unknown"
+
+        # アスペクト比情報の取得
+        # 表示アスペクト比（DAR: Display Aspect Ratio）
+        if "display_aspect_ratio" in video_streams[0]:
+            ret["display_aspect_ratio"] = video_streams[0]["display_aspect_ratio"]
+        elif "dar" in video_streams[0]:
+            ret["display_aspect_ratio"] = video_streams[0]["dar"]
+        elif "tags" in video_streams[0] and "DAR" in video_streams[0]["tags"]:
+            ret["display_aspect_ratio"] = video_streams[0]["tags"]["DAR"]
+        else:
+            # 明示的なDARが指定されていない場合は、幅と高さから計算
+            width = int(video_streams[0]["width"])
+            height = int(video_streams[0]["height"])
+            # gcdを使用して最大公約数を求め、アスペクト比を簡約
+            import math
+
+            gcd = math.gcd(width, height)
+            ret["display_aspect_ratio"] = f"{width // gcd}:{height // gcd}"
+            print(f"アスペクト比を計算: {ret['display_aspect_ratio']}")
+
+        # サンプルアスペクト比（SAR: Sample Aspect Ratio - ピクセルのアスペクト比）
+        if "sample_aspect_ratio" in video_streams[0]:
+            ret["sample_aspect_ratio"] = video_streams[0]["sample_aspect_ratio"]
+        else:
+            ret["sample_aspect_ratio"] = "1:1"  # デフォルト：正方形ピクセル
+
+        # 結果をセット
+        ret["width"] = int(video_streams[0]["width"])
+        ret["height"] = int(video_streams[0]["height"])
+        ret["fps"] = eval(
+            video_streams[0]["avg_frame_rate"]
+        )  # 例: "30000/1001" → 29.97
         ret["audio"] = ffmpeg.input(video_path).audio if has_audio else None
         # ret["nb_frames"] = int(video_streams[0]["nb_frames"])
         # nb_frames が 0 の場合は推定値を算出
@@ -82,35 +126,9 @@ def get_video_meta_info(video_path):
 
         ret["nb_frames"] = nb_frames
         print(f"推定フレーム数: {nb_frames}")
-
-        # アスペクト比情報の取得
-        # 表示アスペクト比（DAR: Display Aspect Ratio）
-        if "display_aspect_ratio" in video_streams[0]:
-            ret["display_aspect_ratio"] = video_streams[0]["display_aspect_ratio"]
-        elif "dar" in video_streams[0]:
-            ret["display_aspect_ratio"] = video_streams[0]["dar"]
-        elif "tags" in video_streams[0] and "DAR" in video_streams[0]["tags"]:
-            ret["display_aspect_ratio"] = video_streams[0]["tags"]["DAR"]
-        else:
-            # 明示的なDARが指定されていない場合は、幅と高さから計算
-            width = int(video_streams[0]["width"])
-            height = int(video_streams[0]["height"])
-            # gcdを使用して最大公約数を求め、アスペクト比を簡約
-            import math
-
-            gcd = math.gcd(width, height)
-            ret["display_aspect_ratio"] = f"{width // gcd}:{height // gcd}"
-            print(
-                f"明示的なDARが指定されていないので計算したアスペクト比: {ret['display_aspect_ratio']}"
-            )
-
-        # サンプルアスペクト比（SAR: Sample Aspect Ratio - ピクセルのアスペクト比）
-        if "sample_aspect_ratio" in video_streams[0]:
-            ret["sample_aspect_ratio"] = video_streams[0]["sample_aspect_ratio"]
-        else:
-            ret["sample_aspect_ratio"] = "1:1"  # デフォルト：正方形ピクセル
-
-        print(f"アスペクト比: {ret['display_aspect_ratio']}")
+        print(
+            f"コーデック: {ret['codec_name']}, アスペクト比: {ret['display_aspect_ratio']}"
+        )
 
         return ret
     except Exception as e:
@@ -118,45 +136,137 @@ def get_video_meta_info(video_path):
 
 
 def get_sub_video(args, num_process, process_idx):
-    """
-    マルチプロセス処理用にビデオを分割する
+    """動画を分割して処理するための部分動画を作成する
 
     Args:
         args: コマンドライン引数
-        num_process: プロセス数
-        process_idx: 現在のプロセスインデックス
+        num_process (int): 並列処理数
+        process_idx (int): 現在の処理インデックス
 
     Returns:
-        str: 分割されたビデオファイルのパス
+        str: 作成された部分動画のファイルパス
+
+    機能:
+        - プログレッシブ映像の場合はストリームコピーを使用して再エンコードを回避
+        - インターレース映像には高品質エンコード設定を適用
+        - オーディオは常にコピーし再エンコードしない
+        - 表示アスペクト比を維持
     """
+    # 単一プロセスの場合は分割不要
     if num_process == 1:
         return args.input
 
-    meta = get_video_meta_info(args.input)
-    duration = int(meta["nb_frames"] / meta["fps"])
-    part_time = duration // num_process
-    print(f"duration: {duration}, part_time: {part_time}")
-    os.makedirs(
-        osp.join(args.output, f"{args.video_name}_inp_tmp_videos"), exist_ok=True
-    )
-    out_path = osp.join(
-        args.output, f"{args.video_name}_inp_tmp_videos", f"{process_idx:03d}.mp4"
-    )
-    cmd = [
-        args.ffmpeg_bin,
-        f"-i {args.input}",
-        "-ss",
-        f"{part_time * process_idx}",
-        f"-to {part_time * (process_idx + 1)}"
-        if process_idx != num_process - 1
-        else "",
-        "-async 1",
-        out_path,
-        "-y",
-    ]
-    print(" ".join(cmd))
-    subprocess.call(" ".join(cmd), shell=True)
-    return out_path
+    # 動画のメタ情報を取得
+    try:
+        meta = get_video_meta_info(args.input)
+        duration = int(meta["nb_frames"] / meta["fps"])
+        part_time = duration // num_process
+        print(f"動画情報: 総時間 {duration}秒, 分割時間 {part_time}秒")
+
+        # 出力ディレクトリの準備
+        tmp_dir = osp.join(args.output, f"{args.video_name}_inp_tmp_videos")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        out_path = osp.join(tmp_dir, f"{process_idx:03d}.mp4")
+
+        # ffmpegコマンドの構築
+        start_time = part_time * process_idx
+        end_time = (
+            part_time * (process_idx + 1) if process_idx != num_process - 1 else ""
+        )
+
+        # 高精度なシーク用に先行入力オプションを追加
+        cmd = [
+            args.ffmpeg_bin,
+            "-nostdin",  # 標準入力を無効化
+            f"-i {args.input}",
+            "-ss",
+            f"{start_time}",
+        ]
+
+        if end_time:
+            cmd.extend(["-to", f"{end_time}"])
+
+        # インターレース情報の処理（引数で明示的に指定された場合のみ）
+        deinterlace_filter = args.deinterlace
+        need_deinterlace = False
+        video_filters = []
+
+        # デインターレースフィルタの処理（明示的な指定のみ）
+        if deinterlace_filter:  # 明示的にフィルタが指定された場合のみ
+            need_deinterlace = True
+            if deinterlace_filter == "yadif":
+                video_filters.append("yadif=mode=0:parity=-1")
+                print("yadifデインターレースフィルタを適用")
+            elif deinterlace_filter == "bwdif":
+                video_filters.append("bwdif=mode=0:parity=-1")
+                print("bwdifデインターレースフィルタを適用")
+            elif deinterlace_filter == "w3fdif":
+                video_filters.append("w3fdif")
+                print("w3fdifデインターレースフィルタを適用")
+            else:
+                print(f"不明なデインターレースフィルタ: {deinterlace_filter}")
+                need_deinterlace = False
+
+        # 表示アスペクト比の設定
+        if "display_aspect_ratio" in meta:
+            # アスペクト比を設定 (setdarフィルタを使用)
+            video_filters.append(
+                f"setdar={meta['display_aspect_ratio'].replace(':', '/')}"
+            )
+            print(f"アスペクト比を設定: {meta['display_aspect_ratio']}")
+
+        # フィルタの適用
+        if video_filters:
+            cmd.extend(["-vf", ",".join(video_filters)])
+
+        # 映像コーデック設定
+        if need_deinterlace:
+            # インターレース映像の場合は高品質エンコード設定を適用
+            cmd.extend(
+                [
+                    "-c:v",
+                    "libx264",  # ビデオコーデックを明示的に指定
+                    "-crf",
+                    "0",  # 高品質設定 (0-51、数値が低いほど高品質)
+                    "-preset",
+                    "slower",  # エンコード品質優先設定
+                    "-tune",
+                    "film",  # フィルム向け調整
+                ]
+            )
+            print("インターレース映像用の高品質エンコード設定を適用")
+        else:
+            # プログレッシブ映像の場合はストリームコピー
+            cmd.extend(["-c:v", "copy"])
+            print("プログレッシブ映像用のストリームコピーを適用（再エンコードなし）")
+
+        # オーディオコーデックの設定（常にコピー）
+        cmd.extend(["-c:a", "copy"])
+
+        # 非同期モードの設定とファイル出力
+        cmd.extend(
+            [
+                "-async",
+                "1",
+                out_path,
+                "-y",
+            ]
+        )
+
+        # コマンドの実行
+        print(f"実行中: {' '.join(cmd)}")
+        result = subprocess.run(" ".join(cmd), shell=True, capture_output=True)
+
+        if result.returncode != 0:
+            print(f"警告: 動画分割中にエラーが発生しました: {result.stderr.decode()}")
+            # エラー出力の詳細をログ
+            print(f"詳細: {result.stderr.decode()[:500]}...")
+
+        return out_path
+    except Exception as e:
+        print(f"エラー: 動画分割中に例外が発生しました: {e}")
+        return args.input  # エラー時は入力動画をそのまま返す
 
 
 class Reader:
@@ -183,7 +293,9 @@ class Reader:
 
         # ビデオファイルの場合の処理
         if self.input_type.startswith("video"):
-            video_path = get_sub_video(args, total_workers, worker_idx)
+            video_path = get_sub_video(
+                args, total_workers, worker_idx
+            )  # TODO PIPE経由にしたい
             self.stream_reader = (
                 ffmpeg.input(video_path)
                 .output("pipe:", format="rawvideo", pix_fmt="bgr24", loglevel="error")
@@ -351,19 +463,40 @@ class Writer:
 
 def inference_video(args, video_save_path, device=None, total_workers=1, worker_idx=0):
     """
-    ビデオ推論のメイン処理関数
-    指定されたモデルを使用してビデオの超解像処理を実行する
+    動画にリアルESRGANを適用して超解像処理を行う関数。
 
-    Args:
-        args: コマンドライン引数
-        video_save_path: 出力ビデオファイルのパス
-        device: 使用するデバイス（GPU/CPU）
-        total_workers: 総ワーカー数
-        worker_idx: 現在のワーカーインデックス
+    引数:
+        args: コマンドライン引数を含むオブジェクト。
+            model_name: 使用するモデルの名前
+            tile: タイル処理のサイズ
+            tile_pad: タイルのパディングサイズ
+            pre_pad: 前処理のパディングサイズ
+            fp32: 32ビット浮動小数点精度を使用するかのフラグ
+            face_enhance: 顔の強調処理を適用するかのフラグ
+            outscale: 出力スケール
+            denoise_strength: ノイズ除去の強さ (0-1)
+        video_save_path: 処理後の動画を保存するパス
+        device: 計算に使用するデバイス (CPU/GPU)。None の場合は自動選択
+        total_workers: 並列処理時の全ワーカー数
+        worker_idx: 現在のワーカーのインデックス
+
+    処理の流れ:
+        1. 指定されたモデル名に基づいて適切なモデルをロード
+        2. モデルが存在しない場合はGitHubからダウンロード
+        3. RealESRGANのアップサンプラーを初期化
+        4. 顔の強調処理が指定されている場合はGFPGANを初期化
+        5. 入力動画のフレームを順次読み込み、超解像処理を適用
+        6. 処理済みのフレームを出力動画に書き込み
+        7. 処理の進捗状況をリアルタイムで表示（FPS、残り時間など）
+
+    注意:
+        - アニメモデルでは顔の強調処理は無効
+        - CUDAメモリ不足の場合はtileパラメータを調整する必要あり
+        - 処理速度はハードウェアとモデルに依存
     """
-    # ---------------------- モデル名に応じたモデル選択 ---------------------- #
+    # ---------------------- determine models according to model names ---------------------- #
     args.model_name = args.model_name.split(".pth")[0]
-    if args.model_name == "RealESRGAN_x4plus":  # x4 RRDBNetモデル
+    if args.model_name == "RealESRGAN_x4plus":  # x4 RRDBNet model
         model = RRDBNet(
             num_in_ch=3,
             num_out_ch=3,
@@ -376,7 +509,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         file_url = [
             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
         ]
-    elif args.model_name == "RealESRNet_x4plus":  # x4 RRDBNetモデル
+    elif args.model_name == "RealESRNet_x4plus":  # x4 RRDBNet model
         model = RRDBNet(
             num_in_ch=3,
             num_out_ch=3,
@@ -391,7 +524,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         ]
     elif (
         args.model_name == "RealESRGAN_x4plus_anime_6B"
-    ):  # x4 RRDBNetモデル（6ブロック版）
+    ):  # x4 RRDBNet model with 6 blocks
         model = RRDBNet(
             num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4
         )
@@ -399,7 +532,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         file_url = [
             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
         ]
-    elif args.model_name == "RealESRGAN_x2plus":  # x2 RRDBNetモデル
+    elif args.model_name == "RealESRGAN_x2plus":  # x2 RRDBNet model
         model = RRDBNet(
             num_in_ch=3,
             num_out_ch=3,
@@ -412,7 +545,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         file_url = [
             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
         ]
-    elif args.model_name == "realesr-animevideov3":  # x4 VGGスタイルモデル（XSサイズ）
+    elif args.model_name == "realesr-animevideov3":  # x4 VGG-style model (XS size)
         model = SRVGGNetCompact(
             num_in_ch=3,
             num_out_ch=3,
@@ -425,7 +558,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         file_url = [
             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth"
         ]
-    elif args.model_name == "realesr-general-x4v3":  # x4 VGGスタイルモデル（Sサイズ）
+    elif args.model_name == "realesr-general-x4v3":  # x4 VGG-style model (S size)
         model = SRVGGNetCompact(
             num_in_ch=3,
             num_out_ch=3,
@@ -440,12 +573,12 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
         ]
 
-    # ---------------------- モデルパスの決定 ---------------------- #
+    # ---------------------- determine model paths ---------------------- #
     model_path = os.path.join("weights", args.model_name + ".pth")
     if not os.path.isfile(model_path):
         ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
         for url in file_url:
-            # model_pathが更新される
+            # model_path will be updated
             model_path = load_file_from_url(
                 url=url,
                 model_dir=os.path.join(ROOT_DIR, "weights"),
@@ -453,16 +586,17 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
                 file_name=None,
             )
 
-    # デノイズ強度制御のためのdni使用
+    # use dni to control the denoise strength
     dni_weight = None
     if args.model_name == "realesr-general-x4v3" and args.denoise_strength != 1:
+        # denoise strengthが1ではない場合、WDNモデルを使用する
         wdn_model_path = model_path.replace(
             "realesr-general-x4v3", "realesr-general-wdn-x4v3"
         )
         model_path = [model_path, wdn_model_path]
         dni_weight = [args.denoise_strength, 1 - args.denoise_strength]
 
-    # アップサンプラーの初期化
+    # restorer
     upsampler = RealESRGANer(
         scale=netscale,
         model_path=model_path,
@@ -475,44 +609,72 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         device=device,
     )
 
-    # アニメモデルでのface enhanceチェック
     if "anime" in args.model_name and args.face_enhance:
         print(
             "face_enhance is not supported in anime models, we turned this option off for you. "
             "if you insist on turning it on, please manually comment the relevant lines of code."
+            "\n注意: アニメモデルでは顔強調機能はサポートされていないため、無効化しました。"
+            "強制的に有効にしたい場合は、該当コードを手動で変更してください。"
         )
         args.face_enhance = False
 
-    # 顔強化処理の初期化（GFPGAN使用）
-    if args.face_enhance:
-        from gfpgan import GFPGANer
+    if args.face_enhance:  # Use GFPGAN for face enhancement
+        try:
+            print("顔強調機能を有効化します（GFPGANモデルをロード中...）")
+            from gfpgan import GFPGANer
 
-        face_enhancer = GFPGANer(
-            model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
-            upscale=args.outscale,
-            arch="clean",
-            channel_multiplier=2,
-            bg_upsampler=upsampler,
-        )  # TODO: カスタムデバイスサポート
+            face_enhancer = GFPGANer(
+                model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
+                upscale=args.outscale,
+                arch="clean",
+                channel_multiplier=2,
+                bg_upsampler=upsampler,
+            )  # TODO support custom device
+            print("GFPGAN顔強調モデルのロードが完了しました")
+        except Exception as e:
+            print("GFPGAN顔強調モデルのロード中にエラーが発生しました: " + str(e))
+            print("顔強調機能を無効化します")
+            face_enhancer = None
+            args.face_enhance = False
     else:
         face_enhancer = None
 
-    # 入出力の初期化
     reader = Reader(args, total_workers, worker_idx)
     audio = reader.get_audio()
     height, width = reader.get_resolution()
     fps = reader.get_fps()
     writer = Writer(args, audio, height, width, video_save_path, fps)
 
-    # フレーム処理のメインループ
-    pbar = tqdm(total=len(reader), unit="frame", desc="inference")
+    # 進捗状況追跡のための変数
+    total_frames = max(1, len(reader))  # 最小値として1を保証
+    processed_frames = 0
+    processing_times = []  # フレームごとの処理時間を記録
+
+    print(
+        "\n動画処理を開始します - モデル: "
+        + args.model_name
+        + ", スケール: "
+        + str(args.outscale)
+        + "倍, タイル: "
+        + str(args.tile)
+    )
+
+    # プログレスバーの設定（フォーマットをカスタマイズ）
+    pbar = tqdm(
+        total=total_frames,
+        unit="frame",
+        desc="処理中",
+        bar_format="{l_bar}{bar:30}| {n_fmt}/{total_fmt} フレーム "
+        + "[経過: {elapsed}, 残り: {remaining}, {rate_fmt}{postfix}]",
+    )
+
     while True:
+        frame_start = time.time()
         img = reader.get_frame()
         if img is None:
             break
 
         try:
-            # 顔強化または通常の超解像処理
             if args.face_enhance and face_enhancer is not None:
                 _, _, output = face_enhancer.enhance(
                     img, has_aligned=False, only_center_face=False, paste_back=True
@@ -520,17 +682,54 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             else:
                 output, _ = upsampler.enhance(img, outscale=args.outscale)
         except RuntimeError as error:
-            print("Error", error)
-            print(
-                "If you encounter CUDA out of memory, try to set --tile with a smaller number."
-            )
+            print("エラー:", error)
+            print("CUDA メモリ不足の場合は、--tile パラメータを小さくしてください。")
         else:
             writer.write_frame(output)
 
-        torch.cuda.synchronize(device)
+        # デバイスに応じた同期処理
+        if device is not None:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elif device.type == "mps":
+                torch.mps.synchronize()  # Apple Silicon用の同期
+
+        # フレーム処理時間の計算と記録
+        frame_time = time.time() - frame_start
+        processing_times.append(frame_time)
+        processed_frames += 1
+
+        # 過去20フレームの平均処理時間から現在のFPSを計算
+        recent_times = processing_times[-min(20, len(processing_times)) :]
+        current_fps = (
+            1.0 / (sum(recent_times) / len(recent_times)) if recent_times else 0
+        )
+
+        # 残りフレーム数と現在の処理速度から残り時間を推定
+        frames_left = total_frames - processed_frames
+        estimated_time_left = frames_left / current_fps if current_fps > 0 else 0
+        hours, remainder = divmod(estimated_time_left, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        # 進捗情報の更新
+        progress_percent = (
+            (processed_frames / total_frames) * 100 if total_frames > 0 else 0
+        )
+        est_time_str = (
+            f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+            if current_fps > 0
+            else "計算中..."
+        )
+
+        pbar.set_postfix(
+            {
+                "FPS": f"{current_fps:.2f}",
+                "進捗": f"{progress_percent:.1f}%",
+                "推定残時間": est_time_str,
+            }
+        )
         pbar.update(1)
 
-    # リソースの解放
     reader.close()
     writer.close()
 
@@ -554,7 +753,6 @@ def run(args):
             f"ffmpeg -i {args.input} -qscale:v 1 -qmin 1 -qmax 1 -vsync 0  {tmp_frames_folder}/frame%08d.png"
         )
         args.input = tmp_frames_folder
-
 
     # デバイスの検出と設定
     if torch.cuda.is_available():
@@ -596,66 +794,103 @@ def run(args):
             print("CPU を使用して処理を実行します（処理に時間がかかります）")
 
         inference_video(args, video_save_path, device=device)
-    else:
-        # マルチプロセス処理
-        ctx = torch.multiprocessing.get_context("spawn")
-        pool = ctx.Pool(num_process)
-        os.makedirs(
-            osp.join(args.output, f"{args.video_name}_out_tmp_videos"), exist_ok=True
+        # ↓↓↓ ここでmkv再パッケージ処理を必ず呼ぶ
+        if args.input.lower().endswith(".mkv"):
+            final_mkv_path = osp.join(
+                args.output, f"{args.video_name}_{args.suffix}.mkv"
+            )
+            print("mkv入力なので、動画以外の全トラックを保持してmkvで出力します")
+            mkv_cmd = [
+                args.ffmpeg_bin,
+                "-i",
+                args.input,
+                "-i",
+                video_save_path,
+                "-map",
+                "1:v:0",
+                "-map",
+                "0:a?",
+                "-map",
+                "0:s?",
+                "-map",
+                "0:t?",
+                "-c",
+                "copy",
+                "-y",
+                final_mkv_path,
+            ]
+            print("mkv再パッケージコマンド: " + " ".join(mkv_cmd))
+            subprocess.run(mkv_cmd, check=True)
+            print("最終出力: " + final_mkv_path)
+            # os.remove(video_save_path)
+        return
+
+    print(f"マルチプロセス処理を開始します（{num_process}プロセス）")
+    ctx = torch.multiprocessing.get_context("spawn")
+    pool = ctx.Pool(num_process)
+    os.makedirs(
+        osp.join(args.output, f"{args.video_name}_out_tmp_videos"), exist_ok=True
+    )
+    pbar = tqdm(total=num_process, unit="sub_video", desc="処理中")
+
+    # マルチプロセス処理
+    for i in range(num_process):
+        sub_video_save_path = osp.join(
+            args.output, f"{args.video_name}_out_tmp_videos", f"{i:03d}.mp4"
         )
-        pbar = tqdm(total=num_process, unit="sub_video", desc="inference")
+
+        # デバイスの選択
+        if device_type == "cuda":
+            # CUDA: 複数GPUがある場合は分散
+            device = torch.device(f"cuda:{i % num_gpus}")
+        elif device_type == "mps" and i == 0:
+            # MPS: Apple Siliconの場合は最初のプロセスのみGPUを使用（MPSは現在マルチプロセスでのGPU共有に制限あり）
+            device = torch.device("mps")
+            print(
+                "警告: Apple Silicon GPUでは1プロセスのみGPUを使用し、残りはCPUで実行されます"
+            )
+        elif device_type == "mps":
+            # MPS: 残りのプロセスはCPUを使用
+            device = torch.device("cpu")
+            print(f"Process {i}: Using CPU as MPS is limited to a single process")
+        else:
+            # CPU処理
+            device = torch.device("cpu")
+
+        pool.apply_async(
+            inference_video,
+            args=(args, sub_video_save_path, device, num_process, i),
+            callback=lambda arg: pbar.update(1),
+        )
+    pool.close()
+    pool.join()
+
+    # combine sub videos
+    # prepare vidlist.txt
+    with open(f"{args.output}/{args.video_name}_vidlist.txt", "w") as f:
         for i in range(num_process):
-            sub_video_save_path = osp.join(
-                args.output, f"{args.video_name}_out_tmp_videos", f"{i:03d}.mp4"
-            )
-            pool.apply_async(
-                inference_video,
-                args=(
-                    args,
-                    sub_video_save_path,
-                    torch.device(i % num_gpus),
-                    num_process,
-                    i,
-                ),
-                callback=lambda arg: pbar.update(1),
-            )
-        pool.close()
-        pool.join()
+            f.write(f"file '{args.video_name}_out_tmp_videos/{i:03d}.mp4'\n")
 
-        # 分割されたビデオの結合
-        # vidlist.txtの準備
-        with open(f"{args.output}/{args.video_name}_vidlist.txt", "w") as f:
-            for i in range(num_process):
-                f.write(f"file '{args.video_name}_out_tmp_videos/{i:03d}.mp4'\n")
+    cmd = [
+        args.ffmpeg_bin,
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        f"{args.output}/{args.video_name}_vidlist.txt",
+        "-c",
+        "copy",
+        f"{video_save_path}",
+    ]
+    print("処理済み動画を結合しています...")
+    print("コマンド: " + " ".join(cmd))
+    subprocess.call(cmd)
+    print("出力動画を保存しました: " + video_save_path)
 
-        # ffmpegでビデオ結合
-        cmd = [
-            args.ffmpeg_bin,
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            f"{args.output}/{args.video_name}_vidlist.txt",
-            "-c",
-            "copy",
-            f"{video_save_path}",
-        ]
-        print(" ".join(cmd))
-        subprocess.call(cmd)
-
-        # 一時ファイルの削除
-        shutil.rmtree(osp.join(args.output, f"{args.video_name}_out_tmp_videos"))
-        if osp.exists(osp.join(args.output, f"{args.video_name}_inp_tmp_videos")):
-            shutil.rmtree(osp.join(args.output, f"{args.video_name}_inp_tmp_videos"))
-        os.remove(f"{args.output}/{args.video_name}_vidlist.txt")
-
-
-    # ↓↓↓ ここでmkv再パッケージ処理を必ず呼ぶ
+    # --- mkv入力時の全トラック保持mkv再パッケージ処理 ---
     if args.input.lower().endswith(".mkv"):
-        final_mkv_path = osp.join(
-            args.output, f"{args.video_name}_{args.suffix}.mkv"
-        )
+        final_mkv_path = osp.join(args.output, f"{args.video_name}_{args.suffix}.mkv")
         print("mkv入力なので、動画以外の全トラックを保持してmkvで出力します")
         mkv_cmd = [
             args.ffmpeg_bin,
@@ -664,13 +899,13 @@ def run(args):
             "-i",
             video_save_path,
             "-map",
-            "1:v:0",
+            "1:v:0",  # 処理済み動画
             "-map",
-            "0:a?",
+            "0:a?",  # 元の音声
             "-map",
-            "0:s?",
+            "0:s?",  # 元の字幕
             "-map",
-            "0:t?",
+            "0:t?",  # 元のチャプター等
             "-c",
             "copy",
             "-y",
@@ -679,9 +914,16 @@ def run(args):
         print("mkv再パッケージコマンド: " + " ".join(mkv_cmd))
         subprocess.run(mkv_cmd, check=True)
         print("最終出力: " + final_mkv_path)
-        # os.remove(video_save_path)
-    return
+        # mp4一時ファイルを削除
+        os.remove(video_save_path)
 
+    # 一時ファイル削除
+    print("一時ファイルを削除しています...")
+    shutil.rmtree(osp.join(args.output, f"{args.video_name}_out_tmp_videos"))
+    if osp.exists(osp.join(args.output, f"{args.video_name}_inp_tmp_videos")):
+        shutil.rmtree(osp.join(args.output, f"{args.video_name}_inp_tmp_videos"))
+    os.remove(f"{args.output}/{args.video_name}_vidlist.txt")
+    return
 
 
 def main():
@@ -794,7 +1036,7 @@ def main():
         type=str,
         default="",
         choices=["", "yadif", "bwdif", "w3fdif"],
-        help="Deinterlace filter for interlaced videos. auto=detect from metadata, yadif=standard, bwdif=higher quality but slower, w3fdif=highest quality (インターレース映像の解除フィルター。auto=自動検出、yadif=標準、bwdif=高品質、w3fdif=最高品質)",
+        help="Deinterlace filter for interlaced videos. yadif=standard, bwdif=higher quality but slower, w3fdif=highest quality (インターレース映像の解除フィルター。yadif=標準、bwdif=高品質、w3fdif=最高品質)",
     )
 
     args = parser.parse_args()
