@@ -649,6 +649,9 @@ def main():
         default="auto",
         help="画像拡張子。オプション: auto | jpg | png、autoは入力と同じ拡張子を使用",
     )
+
+    # TODO --codec オプションの追加(hevc or avc)
+    # TODO --deintelace オプションの追加(ydif or bwdif or w3fdif)
     args = parser.parse_args()
 
     # 入力パスの正規化
