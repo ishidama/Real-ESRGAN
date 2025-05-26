@@ -38,18 +38,83 @@ def get_video_meta_info(video_path):
     Returns:
         dict: ビデオの幅、高さ、FPS、音声情報、フレーム数を含む辞書
     """
-    ret = {}
-    probe = ffmpeg.probe(video_path)
-    video_streams = [
-        stream for stream in probe["streams"] if stream["codec_type"] == "video"
-    ]
-    has_audio = any(stream["codec_type"] == "audio" for stream in probe["streams"])
-    ret["width"] = video_streams[0]["width"]
-    ret["height"] = video_streams[0]["height"]
-    ret["fps"] = eval(video_streams[0]["avg_frame_rate"])
-    ret["audio"] = ffmpeg.input(video_path).audio if has_audio else None
-    ret["nb_frames"] = int(video_streams[0]["nb_frames"])
-    return ret
+    try:
+        ret = {}
+        probe = ffmpeg.probe(video_path)
+
+        video_streams = [
+            stream for stream in probe["streams"] if stream["codec_type"] == "video"
+        ]
+        has_audio = any(stream["codec_type"] == "audio" for stream in probe["streams"])
+        ret["width"] = video_streams[0]["width"]
+        ret["height"] = video_streams[0]["height"]
+        ret["fps"] = eval(video_streams[0]["avg_frame_rate"])
+        ret["audio"] = ffmpeg.input(video_path).audio if has_audio else None
+        # ret["nb_frames"] = int(video_streams[0]["nb_frames"])
+        # nb_frames が 0 の場合は推定値を算出
+        if "nb_frames" in video_streams[0]:
+            nb_frames = int(video_streams[0]["nb_frames"])
+            if nb_frames <= 0:  # 0または負の値の場合
+                duration = (
+                    float(probe["format"]["duration"])
+                    if "format" in probe and "duration" in probe["format"]
+                    else 0
+                )
+                fps = (
+                    eval(video_streams[0]["avg_frame_rate"])
+                    if "avg_frame_rate" in video_streams[0]
+                    else 30
+                )
+                nb_frames = max(1, int(duration * fps))  # 最小値として1を保証
+        else:
+            # durationからフレーム数を計算
+            duration = (
+                float(probe["format"]["duration"])
+                if "format" in probe and "duration" in probe["format"]
+                else 0
+            )
+            fps = (
+                eval(video_streams[0]["avg_frame_rate"])
+                if "avg_frame_rate" in video_streams[0]
+                else 30
+            )
+            nb_frames = max(1, int(duration * fps))  # 最小値として1を保証
+
+        ret["nb_frames"] = nb_frames
+        print(f"推定フレーム数: {nb_frames}")
+
+        # アスペクト比情報の取得
+        # 表示アスペクト比（DAR: Display Aspect Ratio）
+        if "display_aspect_ratio" in video_streams[0]:
+            ret["display_aspect_ratio"] = video_streams[0]["display_aspect_ratio"]
+        elif "dar" in video_streams[0]:
+            ret["display_aspect_ratio"] = video_streams[0]["dar"]
+        elif "tags" in video_streams[0] and "DAR" in video_streams[0]["tags"]:
+            ret["display_aspect_ratio"] = video_streams[0]["tags"]["DAR"]
+        else:
+            # 明示的なDARが指定されていない場合は、幅と高さから計算
+            width = int(video_streams[0]["width"])
+            height = int(video_streams[0]["height"])
+            # gcdを使用して最大公約数を求め、アスペクト比を簡約
+            import math
+
+            gcd = math.gcd(width, height)
+            ret["display_aspect_ratio"] = f"{width // gcd}:{height // gcd}"
+            print(
+                f"明示的なDARが指定されていないので計算したアスペクト比: {ret['display_aspect_ratio']}"
+            )
+
+        # サンプルアスペクト比（SAR: Sample Aspect Ratio - ピクセルのアスペクト比）
+        if "sample_aspect_ratio" in video_streams[0]:
+            ret["sample_aspect_ratio"] = video_streams[0]["sample_aspect_ratio"]
+        else:
+            ret["sample_aspect_ratio"] = "1:1"  # デフォルト：正方形ピクセル
+
+        print(f"アスペクト比: {ret['display_aspect_ratio']}")
+
+        return ret
+    except Exception as e:
+        raise RuntimeError(f"Failed to probe video file {video_path}: {str(e)}")
 
 
 def get_sub_video(args, num_process, process_idx):
@@ -66,6 +131,7 @@ def get_sub_video(args, num_process, process_idx):
     """
     if num_process == 1:
         return args.input
+
     meta = get_video_meta_info(args.input)
     duration = int(meta["nb_frames"] / meta["fps"])
     part_time = duration // num_process
@@ -650,8 +716,21 @@ def main():
         help="画像拡張子。オプション: auto | jpg | png、autoは入力と同じ拡張子を使用",
     )
 
-    # TODO --codec オプションの追加(hevc or avc)
-    # TODO --deintelace オプションの追加(ydif or bwdif or w3fdif)
+    parser.add_argument(
+        "--codec",
+        type=str,
+        default="h264",
+        choices=["avc", "hevc"],
+        help="Video codec for output. h264 is more compatible, hevc (H.265) has better compression but slower encoding (出力動画のコーデック。h264は互換性が高く、hevc (H.265)は圧縮率が高いが処理が遅い)",
+    )
+    parser.add_argument(
+        "--deinterlace",
+        type=str,
+        default="",
+        choices=["", "yadif", "bwdif", "w3fdif"],
+        help="Deinterlace filter for interlaced videos. auto=detect from metadata, yadif=standard, bwdif=higher quality but slower, w3fdif=highest quality (インターレース映像の解除フィルター。auto=自動検出、yadif=標準、bwdif=高品質、w3fdif=最高品質)",
+    )
+
     args = parser.parse_args()
 
     # 入力パスの正規化
