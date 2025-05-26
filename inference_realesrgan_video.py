@@ -18,6 +18,10 @@ from tqdm import tqdm
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
+# TODO アスペクト比がおかしい
+# TODO コーデック選択ができるようにする
+# TODO フレームレートの是正
+
 # ffmpeg-pythonの動的インストール
 try:
     import ffmpeg
