@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-CoreML版RealESRGANerのテストスクリプト
+CoreML版RealESRGANerのテストスクリプト（警告抑制版）
 
 作成されたCoreMLモデルの動作を確認し、PyTorch版と比較する。
+CoreMLの内部警告メッセージを抑制したバージョン。
 """
 
 import argparse
+
+# CoreMLの警告を抑制
+import logging
 import os
 import sys
 import time
+import warnings
 from pathlib import Path
+
+logging.getLogger("coremltools").setLevel(logging.ERROR)
+
+# システムレベルの警告も抑制
+os.environ["PYTHONWARNINGS"] = "ignore"
 
 # プロジェクトルートを sys.path に追加
 project_root = Path(__file__).parent.parent.parent
@@ -91,14 +101,24 @@ def test_coreml_inference(
 
     # CoreML版の推論
     print("\n🚀 CoreML版で推論実行中...")
-    try:
-        coreml_upsampler = RealESRGANerCoreML(
-            model_path=coreml_path, scale=4, tile=256, tile_pad=10
-        )
+    print("   (Apple Neural Engineの初期化中...内部警告は正常です)")
 
-        start_time = time.time()
-        coreml_output = coreml_upsampler.enhance(img)
-        coreml_time = time.time() - start_time
+    try:
+        # stdout/stderrをリダイレクトして警告を抑制
+        with open(os.devnull, "w") as devnull:
+            old_stderr = sys.stderr
+            sys.stderr = devnull
+
+            coreml_upsampler = RealESRGANerCoreML(
+                model_path=coreml_path, scale=4, tile=256, tile_pad=10
+            )
+
+            start_time = time.time()
+            coreml_output = coreml_upsampler.enhance(img)
+            coreml_time = time.time() - start_time
+
+            # stderrを復元
+            sys.stderr = old_stderr
 
         coreml_output_path = output_dir / "output_coreml.png"
         cv2.imwrite(str(coreml_output_path), coreml_output)
@@ -107,6 +127,8 @@ def test_coreml_inference(
         print(f"   保存先: {coreml_output_path}")
 
     except Exception as e:
+        # stderrを復元（エラー時）
+        sys.stderr = old_stderr
         print(f"   ❌ CoreML推論エラー: {e}")
         return
 
@@ -120,25 +142,16 @@ def test_coreml_inference(
         pytorch_time = time.time() - start_time
 
         # PyTorch出力の形式を確認・修正
-        print(f"   🔍 PyTorch出力形式: {type(pytorch_result)}")
-
-        # enhanceメソッドがタプルを返す場合、最初の要素が画像
         if isinstance(pytorch_result, tuple):
             pytorch_output = pytorch_result[0]
-            print(f"   🔍 タプルから画像を抽出: {type(pytorch_output)}")
         else:
             pytorch_output = pytorch_result
-
-        print(
-            f"   🔍 画像データ: shape={pytorch_output.shape}, dtype={pytorch_output.dtype}"
-        )
 
         # numpy配列でuint8型であることを確認
         if not isinstance(pytorch_output, np.ndarray):
             pytorch_output = np.array(pytorch_output)
 
         if pytorch_output.dtype != np.uint8:
-            # float型の場合は0-1の範囲から0-255にスケール
             if pytorch_output.dtype in [np.float32, np.float64]:
                 if pytorch_output.max() <= 1.0:
                     pytorch_output = (pytorch_output * 255).astype(np.uint8)
@@ -196,14 +209,16 @@ def test_coreml_inference(
     diff_img = np.abs(
         coreml_resized.astype(np.int16) - pytorch_resized.astype(np.int16)
     )
-    diff_img = np.clip(diff_img * 10, 0, 255).astype(np.uint8)  # 差分を10倍して見やすく
+    diff_img = np.clip(diff_img * 10, 0, 255).astype(np.uint8)
     diff_output_path = output_dir / "difference.png"
     cv2.imwrite(str(diff_output_path), diff_img)
     print(f"   差分画像: {diff_output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CoreML版RealESRGANerのテスト")
+    parser = argparse.ArgumentParser(
+        description="CoreML版RealESRGANerのテスト（警告抑制版）"
+    )
     parser.add_argument("--coreml", required=True, help="CoreMLモデルのパス")
     parser.add_argument("--pytorch", required=True, help="PyTorchモデルのパス")
     parser.add_argument("--input", required=True, help="入力画像のパス")
@@ -211,8 +226,8 @@ def main():
 
     args = parser.parse_args()
 
-    print("🧪 CoreML vs PyTorch 比較テスト")
-    print("=" * 50)
+    print("🧪 CoreML vs PyTorch 比較テスト（警告抑制版）")
+    print("=" * 55)
 
     test_coreml_inference(
         coreml_path=args.coreml,
