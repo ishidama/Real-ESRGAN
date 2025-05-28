@@ -139,154 +139,18 @@ def get_video_meta_info(video_path):
         raise RuntimeError(f"Failed to probe video file {video_path}: {str(e)}")
 
 
-def get_sub_video(args, num_process, process_idx):
-    """動画を分割して処理するための部分動画を作成する
-
-    Args:
-        args: コマンドライン引数
-        num_process (int): 並列処理数
-        process_idx (int): 現在の処理インデックス
-
-    Returns:
-        str: 作成された部分動画のファイルパス
-
-    機能:
-        - プログレッシブ映像の場合はストリームコピーを使用して再エンコードを回避
-        - インターレース映像には高品質エンコード設定を適用
-        - オーディオは常にコピーし再エンコードしない
-        - 表示アスペクト比を維持
-    """
-    # 単一プロセスの場合は分割不要
-    if num_process == 1:
-        return args.input
-
-    # 動画のメタ情報を取得
-    try:
-        meta = get_video_meta_info(args.input)
-        duration = int(meta["nb_frames"] / meta["fps"])
-        part_time = duration // num_process
-        print(f"動画情報: 総時間 {duration}秒, 分割時間 {part_time}秒")
-
-        # 出力ディレクトリの準備
-        tmp_dir = osp.join(args.output, f"{args.video_name}_inp_tmp_videos")
-        os.makedirs(tmp_dir, exist_ok=True)
-
-        out_path = osp.join(tmp_dir, f"{process_idx:03d}.mp4")
-
-        # ffmpegコマンドの構築
-        start_time = part_time * process_idx
-        end_time = (
-            part_time * (process_idx + 1) if process_idx != num_process - 1 else ""
-        )
-
-        # 高精度なシーク用に先行入力オプションを追加
-        cmd = [
-            args.ffmpeg_bin,
-            "-nostdin",  # 標準入力を無効化
-            f"-i {args.input}",
-            "-ss",
-            f"{start_time}",
-        ]
-
-        if end_time:
-            cmd.extend(["-to", f"{end_time}"])
-
-        # インターレース情報の処理（引数で明示的に指定された場合のみ）
-        deinterlace_filter = args.deinterlace
-        need_deinterlace = False
-        video_filters = []
-
-        # デインターレースフィルタの処理（明示的な指定のみ）
-        if deinterlace_filter:  # 明示的にフィルタが指定された場合のみ
-            need_deinterlace = True
-            if deinterlace_filter == "yadif":
-                video_filters.append("yadif=mode=0:parity=-1")
-                print("yadifデインターレースフィルタを適用")
-            elif deinterlace_filter == "bwdif":
-                video_filters.append("bwdif=mode=0:parity=-1")
-                print("bwdifデインターレースフィルタを適用")
-            elif deinterlace_filter == "w3fdif":
-                video_filters.append("w3fdif")
-                print("w3fdifデインターレースフィルタを適用")
-            else:
-                print(f"不明なデインターレースフィルタ: {deinterlace_filter}")
-                need_deinterlace = False
-
-        # 表示アスペクト比の設定
-        if "display_aspect_ratio" in meta:
-            # アスペクト比を設定 (setdarフィルタを使用)
-            video_filters.append(
-                f"setdar={meta['display_aspect_ratio'].replace(':', '/')}"
-            )
-            print(f"アスペクト比を設定: {meta['display_aspect_ratio']}")
-
-        # フィルタの適用
-        if video_filters:
-            cmd.extend(["-vf", ",".join(video_filters)])
-
-        # 映像コーデック設定
-        if need_deinterlace:
-            # インターレース映像の場合は高品質エンコード設定を適用
-            cmd.extend(
-                [
-                    "-c:v",
-                    "libx264",  # ビデオコーデックを明示的に指定
-                    "-crf",
-                    "0",  # 高品質設定 (0-51、数値が低いほど高品質)
-                    "-preset",
-                    "slower",  # エンコード品質優先設定
-                    "-tune",
-                    "film",  # フィルム向け調整
-                ]
-            )
-            print("インターレース映像用の高品質エンコード設定を適用")
-        else:
-            # プログレッシブ映像の場合はストリームコピー
-            cmd.extend(["-c:v", "copy"])
-            print("プログレッシブ映像用のストリームコピーを適用（再エンコードなし）")
-
-        # オーディオコーデックの設定（常にコピー）
-        cmd.extend(["-c:a", "copy"])
-
-        # 非同期モードの設定とファイル出力
-        cmd.extend(
-            [
-                "-async",
-                "1",
-                out_path,
-                "-y",
-            ]
-        )
-
-        # コマンドの実行
-        print(f"実行中: {' '.join(cmd)}")
-        result = subprocess.run(" ".join(cmd), shell=True, capture_output=True)
-
-        if result.returncode != 0:
-            print(f"警告: 動画分割中にエラーが発生しました: {result.stderr.decode()}")
-            # エラー出力の詳細をログ
-            print(f"詳細: {result.stderr.decode()[:500]}...")
-
-        return out_path
-    except Exception as e:
-        print(f"エラー: 動画分割中に例外が発生しました: {e}")
-        return args.input  # エラー時は入力動画をそのまま返す
-
-
 class Reader:
     """
     入力データ（ビデオ、画像、フォルダ）を読み取るクラス
     ビデオストリームまたは画像ファイルからフレームを順次読み取る
     """
 
-    def __init__(self, args, total_workers=1, worker_idx=0):
+    def __init__(self, args):
         """
         Readerクラスの初期化
 
         Args:
             args: コマンドライン引数
-            total_workers: 総ワーカー数
-            worker_idx: 現在のワーカーインデックス
         """
         self.args = args
         input_type = mimetypes.guess_type(args.input)[0]
@@ -297,8 +161,8 @@ class Reader:
 
         # ビデオファイルの場合の処理
         if self.input_type.startswith("video"):
-            video_path = get_sub_video(args, total_workers, worker_idx)
-            print(f"動画処理: {video_path} (worker {worker_idx + 1}/{total_workers})")
+            video_path = args.input
+            print(f"動画処理: {video_path}")
 
             # 動画のメタ情報を取得
             meta = get_video_meta_info(video_path)
@@ -408,15 +272,7 @@ class Reader:
             if self.input_type.startswith("image"):
                 self.paths = [args.input]
             else:
-                paths = sorted(glob.glob(os.path.join(args.input, "*")))
-                tot_frames = len(paths)
-                num_frame_per_worker = tot_frames // total_workers + (
-                    1 if tot_frames % total_workers else 0
-                )
-                self.paths = paths[
-                    num_frame_per_worker * worker_idx : num_frame_per_worker
-                    * (worker_idx + 1)
-                ]
+                self.paths = sorted(glob.glob(os.path.join(args.input, "*")))
 
             self.nb_frames = len(self.paths)
             assert self.nb_frames > 0, "empty folder"
@@ -556,7 +412,7 @@ class Writer:
         self.stream_writer.wait()
 
 
-def inference_video(args, video_save_path, device=None, total_workers=1, worker_idx=0):
+def inference_video(args, video_save_path, device=None):
     """
     動画にリアルESRGANを適用して超解像処理を行う関数。
 
@@ -734,7 +590,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
     else:
         face_enhancer = None
 
-    reader = Reader(args, total_workers, worker_idx)
+    reader = Reader(args)
     audio = reader.get_audio()
     height, width = reader.get_resolution()
     fps = reader.get_fps()
@@ -830,160 +686,53 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
 
 
 def run(args):
-    """
-    実行のメイン関数
-    入力の前処理、マルチプロセス処理、後処理を行う
-
-    Args:
-        args: コマンドライン引数
-    """
+    """Mac向けシンプル処理関数 - 並列処理なし、MPS最適化"""
     args.video_name = osp.splitext(os.path.basename(args.input))[0]
     video_save_path = osp.join(args.output, f"{args.video_name}_{args.suffix}.mp4")
 
-    # フレーム抽出が指定されている場合の前処理
     if args.extract_frame_first:
         tmp_frames_folder = osp.join(args.output, f"{args.video_name}_inp_tmp_frames")
         os.makedirs(tmp_frames_folder, exist_ok=True)
-        os.system(
-            f"ffmpeg -i {args.input} -qscale:v 1 -qmin 1 -qmax 1 -vsync 0  {tmp_frames_folder}/frame%08d.png"
-        )
-        args.input = tmp_frames_folder
-
-    # デバイスの検出と設定
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        device_type = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        # Apple Silicon (M1/M2/M3) MPSの場合は1つのGPUとしてカウント
-        num_gpus = 1
-        device_type = "mps"
-        print("Using MPS device (Apple Silicon GPU)")
-    else:
-        num_gpus = 0
-        device_type = "cpu"
-        print("Using CPU for processing")
-
-    # プロセス数の計算
-    num_process = max(1, num_gpus * args.num_process_per_gpu)
-    print(f"処理に使用するプロセス数: {num_process}")
-
-    # シングルプロセスの場合
-    if num_process == 1:
-        # デバイスの選択
-        if device_type == "cuda":
-            device = torch.device("cuda:0")
-            print("NVIDIA GPU (CUDA) を使用して処理を実行します")
-        elif device_type == "mps":
-            device = torch.device("mps")
-            print("Apple Silicon GPU (M1/M2/M3) を使用して処理を実行します")
-            if args.fp32:
-                print(
-                    "注意: MPS (Apple Silicon) でfp32を使用します。精度は向上しますが処理速度が低下する場合があります"
-                )
-            else:
-                print(
-                    "注意: MPS (Apple Silicon) でfp16を使用します。処理が不安定な場合は --fp32 を追加してください"
-                )
-        else:
-            device = torch.device("cpu")
-            print("CPU を使用して処理を実行します（処理に時間がかかります）")
-
-        inference_video(args, video_save_path, device=device)
-        # ↓↓↓ ここでmkv再パッケージ処理を必ず呼ぶ
-        if args.input.lower().endswith(".mkv"):
-            final_mkv_path = osp.join(
-                args.output, f"{args.video_name}_{args.suffix}.mkv"
-            )
-            print("mkv入力なので、動画以外の全トラックを保持してmkvで出力します")
-            mkv_cmd = [
+        subprocess.run(
+            [
                 args.ffmpeg_bin,
                 "-i",
                 args.input,
-                "-i",
-                video_save_path,
-                "-map",
-                "1:v:0",
-                "-map",
-                "0:a?",
-                "-map",
-                "0:s?",
-                "-map",
-                "0:t?",
-                "-c",
-                "copy",
-                "-y",
-                final_mkv_path,
-            ]
-            print("mkv再パッケージコマンド: " + " ".join(mkv_cmd))
-            subprocess.run(mkv_cmd, check=True)
-            print("最終出力: " + final_mkv_path)
-            # os.remove(video_save_path)
-        return
-
-    print(f"マルチプロセス処理を開始します（{num_process}プロセス）")
-    ctx = torch.multiprocessing.get_context("spawn")
-    pool = ctx.Pool(num_process)
-    os.makedirs(
-        osp.join(args.output, f"{args.video_name}_out_tmp_videos"), exist_ok=True
-    )
-    pbar = tqdm(total=num_process, unit="sub_video", desc="処理中")
-
-    # マルチプロセス処理
-    for i in range(num_process):
-        sub_video_save_path = osp.join(
-            args.output, f"{args.video_name}_out_tmp_videos", f"{i:03d}.mp4"
+                "-qscale:v",
+                "1",
+                "-qmin",
+                "1",
+                "-qmax",
+                "1",
+                "-vsync",
+                "0",
+                f"{tmp_frames_folder}/frame%08d.png",
+            ],
+            check=True,
         )
+        args.input = tmp_frames_folder
 
-        # デバイスの選択
-        if device_type == "cuda":
-            # CUDA: 複数GPUがある場合は分散
-            device = torch.device(f"cuda:{i % num_gpus}")
-        elif device_type == "mps" and i == 0:
-            # MPS: Apple Siliconの場合は最初のプロセスのみGPUを使用（MPSは現在マルチプロセスでのGPU共有に制限あり）
-            device = torch.device("mps")
+    # Mac向けシンプルなデバイス設定
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Apple Silicon GPU (M1/M2/M3) を使用して処理を実行します")
+        if args.fp32:
             print(
-                "警告: Apple Silicon GPUでは1プロセスのみGPUを使用し、残りはCPUで実行されます"
+                "注意: MPS でfp32を使用します。精度は向上しますが処理速度が低下する場合があります"
             )
-        elif device_type == "mps":
-            # MPS: 残りのプロセスはCPUを使用
-            device = torch.device("cpu")
-            print(f"Process {i}: Using CPU as MPS is limited to a single process")
         else:
-            # CPU処理
-            device = torch.device("cpu")
+            print(
+                "注意: MPS でfp16を使用します。処理が不安定な場合は --fp32 を追加してください"
+            )
+    else:
+        device = torch.device("cpu")
+        print("CPU を使用して処理を実行します（処理に時間がかかります）")
 
-        pool.apply_async(
-            inference_video,
-            args=(args, sub_video_save_path, device, num_process, i),
-            callback=lambda arg: pbar.update(1),
-        )
-    pool.close()
-    pool.join()
+    # 単一プロセスで処理を実行
+    print("単一プロセスで処理を開始します（Mac最適化）")
+    inference_video(args, video_save_path, device=device)
 
-    # combine sub videos
-    # prepare vidlist.txt
-    with open(f"{args.output}/{args.video_name}_vidlist.txt", "w") as f:
-        for i in range(num_process):
-            f.write(f"file '{args.video_name}_out_tmp_videos/{i:03d}.mp4'\n")
-
-    cmd = [
-        args.ffmpeg_bin,
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        f"{args.output}/{args.video_name}_vidlist.txt",
-        "-c",
-        "copy",
-        f"{video_save_path}",
-    ]
-    print("処理済み動画を結合しています...")
-    print("コマンド: " + " ".join(cmd))
-    subprocess.call(cmd)
-    print("出力動画を保存しました: " + video_save_path)
-
-    # --- mkv入力時の全トラック保持mkv再パッケージ処理 ---
+    # MKV入力時の全トラック保持再パッケージ処理
     if args.input.lower().endswith(".mkv"):
         final_mkv_path = osp.join(args.output, f"{args.video_name}_{args.suffix}.mkv")
         print("mkv入力なので、動画以外の全トラックを保持してmkvで出力します")
@@ -1012,13 +761,7 @@ def run(args):
         # mp4一時ファイルを削除
         os.remove(video_save_path)
 
-    # 一時ファイル削除
-    print("一時ファイルを削除しています...")
-    shutil.rmtree(osp.join(args.output, f"{args.video_name}_out_tmp_videos"))
-    if osp.exists(osp.join(args.output, f"{args.video_name}_inp_tmp_videos")):
-        shutil.rmtree(osp.join(args.output, f"{args.video_name}_inp_tmp_videos"))
-    os.remove(f"{args.output}/{args.video_name}_vidlist.txt")
-    return
+    print("処理が完了しました")
 
 
 def main():
