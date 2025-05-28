@@ -297,20 +297,111 @@ class Reader:
 
         # ビデオファイルの場合の処理
         if self.input_type.startswith("video"):
-            video_path = get_sub_video(
-                args, total_workers, worker_idx
-            )  # TODO PIPE経由にしたい
-            self.stream_reader = (
-                ffmpeg.input(video_path)
-                .output("pipe:", format="rawvideo", pix_fmt="bgr24", loglevel="error")
-                .run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin)
-            )
+            video_path = get_sub_video(args, total_workers, worker_idx)
+            print(f"動画処理: {video_path} (worker {worker_idx + 1}/{total_workers})")
+
+            # 動画のメタ情報を取得
             meta = get_video_meta_info(video_path)
             self.width = meta["width"]
             self.height = meta["height"]
             self.input_fps = meta["fps"]
+            print(f"[fps debug] Reader: meta['fps'] = {self.input_fps}")
             self.audio = meta["audio"]
             self.nb_frames = meta["nb_frames"]
+
+            # インターレース情報の処理
+            input_stream = ffmpeg.input(video_path)
+
+            # デインターレース処理の適用
+            # 自動検出（auto）の場合は実データに基づいて決定
+            apply_deinterlace = False
+            deinterlace_filter = args.deinterlace
+
+            if deinterlace_filter == "auto":
+                # NOTE 自動判定モードはまだ未実装なので例外を投げて終了させる
+                raise Exception("自動判定モードは未実装です")
+
+                # if meta.get("is_interlaced", False):
+                #     # インターレースが検出された場合、デフォルトのフィルターを適用
+                #     deinterlace_filter = "bwdif"  # デフォルトでbwdifを使用
+                #     apply_deinterlace = True
+                #     print(
+                #         f"インターレース映像を自動検出: デインターレースフィルター '{deinterlace_filter}' を適用"
+                #     )
+                # else:
+                #     deinterlace_filter = (
+                #         ""  # プログレッシブ映像なのでフィルタリング不要
+                #     )
+                #     print(
+                #         "プログレッシブ映像を検出: デインターレース処理はスキップします"
+                #     )
+            elif deinterlace_filter:  # 明示的に指定された場合
+                if (
+                    not meta.get("is_interlaced", False)
+                    and meta.get("field_order", "") == "progressive"
+                ):
+                    # 明示的にプログレッシブと判定された場合は警告を表示
+                    print(
+                        f"警告: プログレッシブ映像にデインターレースフィルター '{deinterlace_filter}' が指定されました"
+                    )
+                    print(
+                        "  プログレッシブ映像にデインターレース処理を適用すると画質が低下する可能性があります"
+                    )
+                    print(
+                        "  続行する場合は指定されたフィルターを適用します。自動判定を使用するには --deinterlace auto を指定してください"
+                    )
+                    # フィルターは適用する（ユーザーの明示的な指示を尊重）
+                    apply_deinterlace = True
+                else:
+                    # インターレース映像または判定不能な場合は通常通り処理
+                    apply_deinterlace = True
+                    print(f"デインターレースフィルター '{deinterlace_filter}' を適用")
+
+            # デインターレースフィルターの適用
+            if apply_deinterlace and deinterlace_filter != "NONE":
+                if deinterlace_filter == "yadif":
+                    # yadif = Yet Another DeInterlacing Filter
+                    input_stream = input_stream.filter("yadif", mode=0, parity=-1)
+                    print(f"デインターレース処理を適用しました: {deinterlace_filter}")
+                elif deinterlace_filter == "bwdif":
+                    # bwdif = Bob Weaver DeInterlacing Filter
+                    input_stream = input_stream.filter("bwdif", mode=0, parity=-1)
+                    print(f"デインターレース処理を適用しました: {deinterlace_filter}")
+                elif deinterlace_filter == "w3fdif":
+                    # w3fdif = 3-field deinterlacing filter
+                    input_stream = input_stream.filter("w3fdif")
+                    print(f"デインターレース処理を適用しました: {deinterlace_filter}")
+            else:
+                # 指定のためフィルタリング不要
+                print(
+                    f"指定のためデインターレース処理はスキップ : {deinterlace_filter}"
+                )
+
+            # SAR補正（ピクセルアスペクト比が1:1でない場合は正方ピクセル化）
+            sar = meta.get("sample_aspect_ratio", "1:1")
+            if sar != "1:1":
+                try:
+                    sar_num, sar_den = map(int, sar.split(":"))
+                    new_width = int(round(self.width * sar_num / sar_den))
+                    input_stream = input_stream.filter("scale", new_width, self.height)
+                    input_stream = input_stream.filter(
+                        "setsar", 1
+                    )  # ffmpeg setsarは整数でOK
+                    print(
+                        f"SAR補正: {sar} → 1:1, リサイズ後: {new_width}x{self.height}"
+                    )
+                    self.width = new_width  # 後続処理のため幅も更新
+                except Exception as e:
+                    print(f"SAR補正処理中にエラー: {e}")
+
+            # ffmpegを使用してパイプ経由でフレームを読み込む設定
+            self.stream_reader = input_stream.output(
+                "pipe:", format="rawvideo", pix_fmt="bgr24", loglevel="error"
+            ).run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin)
+
+            print(
+                f"動画情報: {self.width}x{self.height}, {self.input_fps}fps, {self.nb_frames}フレーム"
+            )
 
         else:
             # 画像またはフォルダの場合の処理
@@ -1038,8 +1129,8 @@ def main():
     parser.add_argument(
         "--deinterlace",
         type=str,
-        default="",
-        choices=["", "yadif", "bwdif", "w3fdif"],
+        default="bwdif",
+        choices=["NONE", "yadif", "bwdif", "w3fdif", "auto"],
         help="Deinterlace filter for interlaced videos. yadif=standard, bwdif=higher quality but slower, w3fdif=highest quality (インターレース映像の解除フィルター。yadif=標準、bwdif=高品質、w3fdif=最高品質)",
     )
 
