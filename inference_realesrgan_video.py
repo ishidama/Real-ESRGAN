@@ -969,12 +969,6 @@ def main():
     else:
         is_video = False
 
-    # FLVファイルをMP4に変換
-    if is_video and args.input.endswith(".flv"):
-        mp4_path = args.input.replace(".flv", ".mp4")
-        os.system(f"ffmpeg -i {args.input} -codec copy {mp4_path}")
-        args.input = mp4_path
-
     # ビデオでない場合はフレーム抽出オプションを無効化
     if args.extract_frame_first and not is_video:
         args.extract_frame_first = False
