@@ -94,9 +94,25 @@ def get_video_meta_info(video_path):
         # 結果をセット
         ret["width"] = int(video_streams[0]["width"])
         ret["height"] = int(video_streams[0]["height"])
-        ret["fps"] = eval(
-            video_streams[0]["avg_frame_rate"]
-        )  # 例: "30000/1001" → 29.97
+
+        # フレームレートの正確な処理
+        if "avg_frame_rate" in video_streams[0]:
+            fps_str = video_streams[0]["avg_frame_rate"]
+            try:
+                # 分数形式（例: "30000/1001"）の場合
+                if "/" in fps_str:
+                    num, den = map(int, fps_str.split("/"))
+                    ret["fps"] = num / den
+                    print(f"フレームレート: {fps_str} = {ret['fps']:.6f}fps")
+                else:
+                    # 小数形式の場合
+                    ret["fps"] = float(fps_str)
+                    print(f"フレームレート: {ret['fps']}fps")
+            except Exception as e:
+                print(f"フレームレート解析エラー: {e}, デフォルト値30を使用")
+                ret["fps"] = 30.0
+        else:
+            ret["fps"] = 30.0  # デフォルト値
         ret["audio"] = ffmpeg.input(video_path).audio if has_audio else None
         # ret["nb_frames"] = int(video_streams[0]["nb_frames"])
         # nb_frames が 0 の場合は推定値を算出
@@ -287,12 +303,24 @@ class Reader:
         return self.height, self.width
 
     def get_fps(self):
-        """FPS（フレームレート）を取得"""
+        """出力フレームレートを決定して返す
+
+        コマンドライン引数で指定されたfpsを優先、
+        指定がなければ元の動画のfps、それも取得できない場合はデフォルト値を使用。
+
+        Returns:
+            float: フレームレート
+        """
         if self.args.fps is not None:
+            print(
+                f"[fps debug] Reader.get_fps() returns user-specified {self.args.fps}"
+            )
             return self.args.fps
         elif self.input_fps is not None:
+            print(f"[fps debug] Reader.get_fps() returns original {self.input_fps}")
             return self.input_fps
-        return 24
+        print("[fps debug] Reader.get_fps() fallback to 24")
+        return 24  # デフォルト値
 
     def get_audio(self):
         """音声ストリームを取得"""
@@ -335,81 +363,132 @@ class Reader:
 
 
 class Writer:
-    """
-    処理済みフレームをビデオファイルに書き出すクラス
-    ffmpegを使用してエンコードとファイル出力を行う
+    """処理したフレームを動画ファイルに書き込むクラス
+
+    ffmpegを使用して、処理されたフレームをパイプ経由で動画ファイルに書き込みます。
+    音声トラックがある場合はそれも保持されます。
+    ソース動画のアスペクト比も維持されます。
     """
 
     def __init__(self, args, audio, height, width, video_save_path, fps):
-        """
-        Writerクラスの初期化
+        """ライターの初期化
 
         Args:
             args: コマンドライン引数
-            audio: 音声ストリーム
-            height: 入力画像の高さ
-            width: 入力画像の幅
-            video_save_path: 出力ビデオファイルのパス
-            fps: フレームレート
+            audio: 音声ストリーム（または None）
+            height (int): 入力フレームの高さ
+            width (int): 入力フレームの幅
+            video_save_path (str): 出力動画のファイルパス
+            fps (float): フレームレート
         """
-        # 出力解像度の計算（スケール倍率を適用）
-        out_width, out_height = int(width * args.outscale), int(height * args.outscale)
+        # 出力解像度の計算
+        out_width = int(width * args.outscale)
+        out_height = int(height * args.outscale)
+
+        # 4K以上の解像度に関する警告
         if out_height > 2160:
             print(
-                "You are generating video that is larger than 4K, which will be very slow due to IO speed.",
-                "We highly recommend to decrease the outscale(aka, -s).",
+                "警告: 4K以上の解像度の動画を生成しています。IO速度によって非常に遅くなる可能性があります。",
+                f"現在の出力解像度: {out_width}x{out_height}",
+                "outscale パラメータ(-s)を小さくすることを推奨します。",
             )
 
-        # 音声ありの場合のffmpeg設定
-        if audio is not None:
-            self.stream_writer = (
-                ffmpeg.input(
-                    "pipe:",
-                    format="rawvideo",
-                    pix_fmt="bgr24",
-                    s=f"{out_width}x{out_height}",
-                    framerate=fps,
-                )
-                .output(
-                    audio,
-                    video_save_path,
-                    pix_fmt="yuv420p",
-                    vcodec="libx264",
-                    loglevel="error",
-                    acodec="copy",
-                )
-                .overwrite_output()
-                .run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin)
+        try:
+            # 出力設定の基本部分（共通）
+            input_stream = ffmpeg.input(
+                "pipe:",
+                format="rawvideo",
+                pix_fmt="bgr24",
+                s=f"{out_width}x{out_height}",
+                framerate=fps,
             )
-        else:
-            # 音声なしの場合のffmpeg設定
-            self.stream_writer = (
-                ffmpeg.input(
-                    "pipe:",
-                    format="rawvideo",
-                    pix_fmt="bgr24",
-                    s=f"{out_width}x{out_height}",
-                    framerate=fps,
+
+            # 入力動画からアスペクト比情報を取得（存在する場合）
+            display_aspect_ratio = None
+            if hasattr(args, "input") and os.path.exists(args.input):
+                try:
+                    meta = get_video_meta_info(args.input)
+                    if "display_aspect_ratio" in meta:
+                        display_aspect_ratio = meta["display_aspect_ratio"]
+                        print(f"元の表示アスペクト比を取得: {display_aspect_ratio}")
+                except Exception as e:
+                    print(f"アスペクト比情報の取得中にエラーが発生しました: {e}")
+
+            # アスペクト比を設定（存在する場合）
+            if display_aspect_ratio:
+                # ffmpegのフィルタとしてアスペクト比を設定
+                input_stream = input_stream.filter(
+                    "setdar", display_aspect_ratio.replace(":", "/")
                 )
-                .output(
-                    video_save_path,
-                    pix_fmt="yuv420p",
-                    vcodec="libx264",
-                    loglevel="error",
+                print(f"元の表示アスペクト比を維持: {display_aspect_ratio}")
+
+            # ビデオコーデック設定
+            video_codec_args = {
+                "pix_fmt": "yuv420p",
+                "preset": "medium",  # エンコード速度と品質のバランス
+                "loglevel": "error",
+            }
+
+            # コーデック選択（H.264またはHEVC/H.265）
+            if hasattr(args, "codec") and args.codec == "hevc":
+                video_codec_args["vcodec"] = "libx265"
+                video_codec_args["crf"] = "18"  # H.265では23が標準的なH.264の23相当品質
+                print(
+                    "HEVC/H.265コーデックを使用します（高圧縮・高品質、エンコードに時間がかかります）"
                 )
-                .overwrite_output()
-                .run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin)
-            )
+            else:  # h264
+                video_codec_args["vcodec"] = "libx264"
+                video_codec_args["crf"] = "23"  # H.264の標準品質
+
+            # 音声がある場合とない場合で出力設定を変更
+            if audio is not None:
+                print(f"音声トラックを出力動画に含めます: {video_save_path}")
+                self.stream_writer = (
+                    input_stream.output(
+                        audio,
+                        video_save_path,
+                        **video_codec_args,
+                        acodec="copy",  # 音声はそのままコピー
+                        r=fps,  # フレームレートを指定
+                    )
+                    .overwrite_output()
+                    .run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin)
+                )
+            else:
+                print(f"音声なしで出力動画を生成します: {video_save_path}")
+                self.stream_writer = (
+                    input_stream.output(
+                        video_save_path,
+                        **video_codec_args,
+                    )
+                    .overwrite_output()
+                    .run_async(pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin)
+                )
+
+        except Exception as e:
+            raise RuntimeError(f"動画ライターの初期化に失敗しました: {e}")
 
     def write_frame(self, frame):
-        """フレームをビデオストリームに書き込み"""
-        frame = frame.astype(np.uint8).tobytes()
-        self.stream_writer.stdin.write(frame)
+        """1フレームを動画ファイルに書き込む
+
+        Args:
+            frame (np.ndarray): 書き込むフレーム画像
+        """
+        try:
+            # numpyの配列をバイト列に変換
+            frame_bytes = frame.astype(np.uint8).tobytes()
+            self.stream_writer.stdin.write(frame_bytes)
+        except Exception as e:
+            print(f"フレーム書き込み中にエラーが発生しました: {e}")
 
     def close(self):
-        """ストリームを閉じてリソースを解放"""
-        self.stream_writer.stdin.close()
-        self.stream_writer.wait()
+        """ライターを閉じてリソースを解放する"""
+        try:
+            self.stream_writer.stdin.close()
+            self.stream_writer.wait()
+            print("動画の書き込みが完了しました")
+        except Exception as e:
+            print(f"ライターのクローズ中にエラーが発生しました: {e}")
 
 
 def inference_video(args, video_save_path, device=None):
@@ -865,7 +944,7 @@ def main():
     parser.add_argument(
         "--codec",
         type=str,
-        default="h264",
+        default="hevc",
         choices=["avc", "hevc"],
         help="Video codec for output. h264 is more compatible, hevc (H.265) has better compression but slower encoding (出力動画のコーデック。h264は互換性が高く、hevc (H.265)は圧縮率が高いが処理が遅い)",
     )
